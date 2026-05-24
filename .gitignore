@@ -7,3 +7,5 @@ sanity_model.pt
 best_model_pre_egnn.pt
 .hydra/
 *.log
+lightning_best.ckpt
+lightning_best-v*.ckpt

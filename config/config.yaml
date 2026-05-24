@@ -18,7 +18,8 @@ training:
   T: 200
   use_internal: true
   lambda_constraint: 0.5
-  resume: null
+  resume: null       # weight-only .pt load (backward compat)
+  ckpt_path: null    # full Lightning .ckpt resume (restores optimizer + scheduler)
   checkpoint: best_model.pt
 
 hydra:
