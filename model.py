@@ -133,7 +133,8 @@ class GNNDenoiser(nn.Module):
 
         self.t_dim = t_dim
 
-    def forward(self, coords_noisy, atom_types, edge_index, edge_attr, t, batch=None):
+    def forward(self, coords_noisy, atom_types, edge_index, edge_attr, t,
+                batch=None, cond_emb=None):
         """
         coords_noisy: (N, 2)
         atom_types:   (N,)
@@ -141,6 +142,8 @@ class GNNDenoiser(nn.Module):
         edge_attr:    (E, n_bond_types)
         t:            (B,)
         batch:        (N,) or None
+        cond_emb:     (N, hidden_dim) or None — per-atom condition embedding
+                      (e.g. ring count, scaffold flags) added to h after input_proj
 
         Returns x0_pred: (N, 2) — predicted clean coordinates.
         """
@@ -156,6 +159,8 @@ class GNNDenoiser(nn.Module):
             t_emb_per_atom = t_emb[batch]
 
         h = self.input_proj(torch.cat([self.atom_emb(atom_types), t_emb_per_atom], dim=-1))
+        if cond_emb is not None:
+            h = h + cond_emb  # additive injection — same hidden_dim, preserves invariance
         x = coords_noisy
 
         for layer in self.layers:

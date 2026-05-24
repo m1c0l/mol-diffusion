@@ -30,12 +30,12 @@ class MolData(Data):
     def __inc__(self, key, value, *args, **kwargs):
         if key in ('angle_triples', 'tree_src', 'tree_dst'):
             return self.num_nodes
-        if key == 'dataset_idx':
+        if key in ('dataset_idx', 'ring_count_bucket'):
             return 0
         return super().__inc__(key, value, *args, **kwargs)
 
     def __cat_dim__(self, key, value, *args, **kwargs):
-        if key == 'dataset_idx':
+        if key in ('dataset_idx', 'ring_count_bucket'):
             return 0
         return super().__cat_dim__(key, value, *args, **kwargs)
 
@@ -88,6 +88,10 @@ def mol_to_pyg_with_bond_types(mol: Molecule2D, smiles: str) -> MolData:
     angle_triples = (torch.tensor(mol.angle_triples, dtype=torch.long)
                      if mol.angle_triples else torch.zeros(0, 3, dtype=torch.long))
 
+    # Ring count bucket: 0=null(CFG), 1=0rings, 2=1ring, 3=2rings, 4=3+rings
+    n_rings = rdmol.GetRingInfo().NumRings() if rdmol is not None else 0
+    ring_bucket = min(n_rings, 3) + 1  # maps 0→1, 1→2, 2→3, 3+→4
+
     return MolData(
         pos=coords, atom_types=atom_types,
         edge_index=edge_index, edge_attr=edge_attr,
@@ -96,6 +100,7 @@ def mol_to_pyg_with_bond_types(mol: Molecule2D, smiles: str) -> MolData:
         tree_src=torch.tensor([e[0] for e in tree_edges], dtype=torch.long),
         tree_dst=torch.tensor([e[1] for e in tree_edges], dtype=torch.long),
         dataset_idx=torch.tensor([-1], dtype=torch.long),
+        ring_count_bucket=torch.tensor([ring_bucket], dtype=torch.long),
     )
 
 
@@ -210,6 +215,12 @@ class MolDiffusionModule(L.LightningModule):
         self.model = GNNDenoiser(hidden_dim=mc.hidden_dim,
                                  n_layers=mc.n_layers, t_dim=mc.t_dim)
 
+        # Ring count conditioning: buckets 1-4 (0 = null token for CFG dropout)
+        if mc.ring_cond:
+            self.ring_emb = torch.nn.Embedding(5, mc.hidden_dim)
+        else:
+            self.ring_emb = None
+
         schedule = cosine_schedule(tc.T)
         for k, v in schedule.items():
             self.register_buffer(k, v)  # moved to device automatically
@@ -223,6 +234,19 @@ class MolDiffusionModule(L.LightningModule):
     def on_fit_start(self):
         self.train_ds = self.trainer.datamodule.train_ds
         self.val_ds   = self.trainer.datamodule.val_ds
+
+    def _cond_emb(self, batch):
+        """Per-atom ring count embedding with CFG dropout during training."""
+        if self.ring_emb is None:
+            return None
+        buckets = batch.ring_count_bucket  # (B,)
+        if self.training and self.cfg.training.cfg_dropout > 0:
+            drop = torch.bernoulli(
+                torch.full((buckets.shape[0],), self.cfg.training.cfg_dropout,
+                           device=buckets.device)
+            ).bool()
+            buckets = buckets.masked_fill(drop, 0)  # 0 = null token
+        return self.ring_emb(buckets)[batch.batch]  # (N, hidden_dim)
 
     def _forward(self, batch, ds):
         tc = self.cfg.training
@@ -242,10 +266,11 @@ class MolDiffusionModule(L.LightningModule):
                 np.concatenate(clean_list, 0).astype(np.float32)).to(self.device)
             batch  = batch.to(self.device)
             t_dev  = t_step.to(self.device)
+            cond   = self._cond_emb(batch)
 
             x0_pred = self.model(noisy_pos, batch.atom_types,
                                  batch.edge_index, batch.edge_attr,
-                                 t_dev, batch=batch.batch)
+                                 t_dev, batch=batch.batch, cond_emb=cond)
             loss = F.mse_loss(x0_pred, x0_target)
 
             if tc.lambda_constraint > 0:
@@ -260,10 +285,11 @@ class MolDiffusionModule(L.LightningModule):
             noise      = torch.randn_like(batch.pos)
             abar       = self.alpha_bar[t_per_atom].unsqueeze(-1)
             noisy_pos  = batch.pos * abar.sqrt() + noise * (1 - abar).sqrt()
+            cond       = self._cond_emb(batch)
 
             pred_noise = self.model(noisy_pos, batch.atom_types,
                                     batch.edge_index, batch.edge_attr,
-                                    t_dev, batch=batch.batch)
+                                    t_dev, batch=batch.batch, cond_emb=cond)
             loss = F.mse_loss(pred_noise, noise)
 
             if tc.lambda_constraint > 0:
