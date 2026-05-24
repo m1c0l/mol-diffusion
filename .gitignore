@@ -4,8 +4,12 @@ __pycache__/
 *.png
 chembl_mols.json
 sanity_model.pt
+sanity_ring_cond_model.pt
+ring_cond_model.pt
 best_model_pre_egnn.pt
 .hydra/
 *.log
+.DS_Store
 lightning_best.ckpt
 lightning_best-v*.ckpt
+lightning_logs/

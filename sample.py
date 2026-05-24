@@ -25,31 +25,61 @@ from model import GNNDenoiser
 from noise import cosine_schedule, p_sample_step_x0
 
 
-def load_model(path: str, device, hidden_dim=128, n_layers=4) -> GNNDenoiser:
+def load_model(path: str, device, hidden_dim=128, n_layers=4):
+    """Load weights. Auto-detects conditional checkpoint by presence of ring_emb keys."""
+    state = torch.load(path, map_location=device)
+    ring_emb = None
+    if any(k.startswith('ring_emb.') for k in state):
+        # Conditional checkpoint: extract ring_emb separately
+        ring_emb_w = {k[len('ring_emb.'):]: v for k, v in state.items() if k.startswith('ring_emb.')}
+        model_state = {k[len('model.'):]: v for k, v in state.items() if k.startswith('model.')}
+        ring_emb = torch.nn.Embedding(5, hidden_dim).to(device)
+        ring_emb.load_state_dict(ring_emb_w)
+        ring_emb.eval()
+    else:
+        model_state = state
+
     model = GNNDenoiser(hidden_dim=hidden_dim, n_layers=n_layers).to(device)
-    model.load_state_dict(torch.load(path, map_location=device))
+    model.load_state_dict(model_state)
     model.eval()
-    return model
+    return model, ring_emb
 
 
 @torch.no_grad()
-def sample_molecule(pyg_data, model, schedule, T: int, device) -> np.ndarray:
+def sample_molecule(pyg_data, model, schedule, T: int, device,
+                    ring_emb=None, rings: int = -1, guidance: float = 1.0) -> np.ndarray:
     """
     Run full reverse diffusion for one molecule.
     Returns generated coordinates: (N, 2) numpy array.
+
+    rings: target ring count (-1 = unconditional).
+           Bucket mapping: 0→1, 1→2, 2→3, 3+→4 (0 is null/CFG token).
+    guidance: CFG guidance scale. 1.0 = conditioned only, >1.0 amplifies
+              the conditioning signal by interpolating away from the null pred.
     """
     data = pyg_data.to(device)
     N = data.pos.shape[0]
+    batch = torch.zeros(N, dtype=torch.long, device=device)
+
+    cond_emb = None
+    null_emb = None
+    if ring_emb is not None and rings >= 0:
+        bucket = torch.tensor([min(rings, 3) + 1], dtype=torch.long, device=device)
+        cond_emb = ring_emb(bucket).expand(N, -1)  # (N, hidden_dim)
+        if guidance != 1.0:
+            null_bucket = torch.tensor([0], dtype=torch.long, device=device)
+            null_emb = ring_emb(null_bucket).expand(N, -1)
 
     coords = torch.randn(N, 2, device=device)
 
     for t in range(T, 0, -1):
         t_tensor = torch.tensor([t], device=device)
-        x0_pred = model(
-            coords, data.atom_types,
-            data.edge_index, data.edge_attr,
-            t_tensor, batch=torch.zeros(N, dtype=torch.long, device=device)
-        )
+        x0_pred = model(coords, data.atom_types, data.edge_index, data.edge_attr,
+                        t_tensor, batch=batch, cond_emb=cond_emb)
+        if null_emb is not None:
+            x0_null = model(coords, data.atom_types, data.edge_index, data.edge_attr,
+                            t_tensor, batch=batch, cond_emb=null_emb)
+            x0_pred = x0_null + guidance * (x0_pred - x0_null)
         coords = p_sample_step_x0(coords, x0_pred, t, schedule)
 
     return coords.cpu().numpy()
@@ -105,8 +135,14 @@ def evaluate(args):
     print(f"Device: {device}")
 
     schedule = {k: v.to(device) for k, v in cosine_schedule(args.T).items()}
-    model = load_model(args.checkpoint, device,
-                       hidden_dim=args.hidden_dim, n_layers=args.n_layers)
+    model, ring_emb = load_model(args.checkpoint, device,
+                                 hidden_dim=args.hidden_dim, n_layers=args.n_layers)
+
+    if ring_emb is not None:
+        cond_str = f"ring_cond  rings={args.rings}  guidance={args.guidance}"
+    else:
+        cond_str = "unconditional"
+    print(f"Mode: {cond_str}")
 
     mols = build_dataset(source='chembl')
     with open('chembl_mols.json') as f:
@@ -125,12 +161,16 @@ def evaluate(args):
 
     # Plot: curated complexity ladder
     plot_idx = select_complexity_ladder(mols, smiles_list, val_idx, n_plot=12)
-    plot_set  = set(plot_idx)
 
     print(f"Sampling {n_sample} molecules (12 curated for plot)...")
 
     gt_bl, gen_bl = [], []
     gt_ba, gen_ba = [], []
+
+    def _sample(pyg):
+        return sample_molecule(pyg, model, schedule, args.T, device,
+                               ring_emb=ring_emb, rings=args.rings,
+                               guidance=args.guidance)
 
     # Pre-generate the 12 plot molecules
     plot_results = {}
@@ -138,7 +178,7 @@ def evaluate(args):
         mol    = mols[idx]
         smiles = smiles_list[idx]
         pyg    = mol_to_pyg_with_bond_types(mol, smiles)
-        gen    = sample_molecule(pyg, model, schedule, args.T, device)
+        gen    = _sample(pyg)
         bl     = compute_bond_lengths(gen, mol.bonds)
         if len(bl) > 0:
             gen /= bl.mean()
@@ -153,7 +193,7 @@ def evaluate(args):
         if idx in plot_results:
             gen_coords = plot_results[idx]
         else:
-            gen_coords = sample_molecule(pyg, model, schedule, args.T, device)
+            gen_coords = _sample(pyg)
             bl_gen = compute_bond_lengths(gen_coords, mol.bonds)
             if len(bl_gen) > 0:
                 gen_coords /= bl_gen.mean()
@@ -195,7 +235,8 @@ def evaluate(args):
         if plot_count == 0:
             ax.legend(fontsize=6, loc='upper right')
 
-    plt.suptitle("Complexity ladder: simple → complex  |  Blue=RDKit  /  Coral=Generated",
+    cond_label = f"rings={args.rings} guidance={args.guidance}" if ring_emb is not None else "unconditional"
+    plt.suptitle(f"Complexity ladder [{cond_label}]  |  Blue=RDKit  /  Coral=Generated",
                  fontsize=10)
     plt.tight_layout()
     plt.savefig('generated_molecules.png', dpi=150)
@@ -249,5 +290,12 @@ if __name__ == '__main__':
     parser.add_argument('--T',          type=int,   default=200)
     parser.add_argument('--hidden_dim', type=int,   default=128)
     parser.add_argument('--n_layers',   type=int,   default=4)
+    # Ring conditioning (only used when checkpoint contains ring_emb weights)
+    parser.add_argument('--rings',    type=int,   default=-1,
+                        help='Target ring count: 0=acyclic, 1=one ring, 2=two, 3=three+. '
+                             '-1 = unconditional (null token).')
+    parser.add_argument('--guidance', type=float, default=1.0,
+                        help='CFG guidance scale. 1.0 = conditioned only. '
+                             '>1.0 amplifies the conditioning signal.')
     args = parser.parse_args()
     evaluate(args)
