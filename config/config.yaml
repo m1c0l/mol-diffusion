@@ -9,7 +9,7 @@ model:
   hidden_dim: 128
   n_layers: 4
   t_dim: 64
-  ring_cond: true   # inject ring count embedding (0-3+ rings, bucket 1-4; 0=null/CFG)
+  module: unconditional  # 'unconditional' | 'ring_cond'
 
 training:
   epochs: 150
@@ -19,7 +19,6 @@ training:
   T: 200
   use_internal: true
   lambda_constraint: 0.5
-  cfg_dropout: 0.1   # probability of dropping ring condition (CFG null token)
   resume: null       # weight-only .pt load (backward compat)
   ckpt_path: null    # full Lightning .ckpt resume (restores optimizer + scheduler)
   checkpoint: best_model.pt

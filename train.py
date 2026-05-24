@@ -196,15 +196,10 @@ class MolDataModule(L.LightningDataModule):
 
 class MolDiffusionModule(L.LightningModule):
     """
-    EGNN denoiser wrapped as a LightningModule.
+    Unconditional EGNN denoiser. Base class for all diffusion modules.
 
-    Benefits over the plain train loop:
-      - Device handling is automatic (MPS/CUDA/CPU)
-      - ModelCheckpoint saves both Lightning .ckpt (full state: optimizer,
-        scheduler, epoch) and a weight-only .pt for backward compat with sample.py
-      - Resuming with training.ckpt_path restores optimizer + scheduler state,
-        fixing the LR annealing regression we saw with weight-only resuming
-      - training_step / validation_step are clean and symmetric
+    Subclass and override _cond_emb() to add conditioning.
+    All training/validation logic, optimizer, and scheduler are inherited.
     """
 
     def __init__(self, cfg: DictConfig):
@@ -215,38 +210,24 @@ class MolDiffusionModule(L.LightningModule):
         self.model = GNNDenoiser(hidden_dim=mc.hidden_dim,
                                  n_layers=mc.n_layers, t_dim=mc.t_dim)
 
-        # Ring count conditioning: buckets 1-4 (0 = null token for CFG dropout)
-        if mc.ring_cond:
-            self.ring_emb = torch.nn.Embedding(5, mc.hidden_dim)
-        else:
-            self.ring_emb = None
-
         schedule = cosine_schedule(tc.T)
         for k, v in schedule.items():
-            self.register_buffer(k, v)  # moved to device automatically
+            self.register_buffer(k, v)
 
         if tc.resume:
             self.model.load_state_dict(torch.load(tc.resume, map_location='cpu'))
             print(f"Loaded weights from {tc.resume}")
 
-        print(f"Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"Parameters: {sum(p.numel() for p in self.parameters()):,}")
 
     def on_fit_start(self):
         self.train_ds = self.trainer.datamodule.train_ds
         self.val_ds   = self.trainer.datamodule.val_ds
 
     def _cond_emb(self, batch):
-        """Per-atom ring count embedding with CFG dropout during training."""
-        if self.ring_emb is None:
-            return None
-        buckets = batch.ring_count_bucket  # (B,)
-        if self.training and self.cfg.training.cfg_dropout > 0:
-            drop = torch.bernoulli(
-                torch.full((buckets.shape[0],), self.cfg.training.cfg_dropout,
-                           device=buckets.device)
-            ).bool()
-            buckets = buckets.masked_fill(drop, 0)  # 0 = null token
-        return self.ring_emb(buckets)[batch.batch]  # (N, hidden_dim)
+        """Returns per-atom condition embedding (N, hidden_dim) or None.
+        Override in subclasses to add conditioning."""
+        return None
 
     def _forward(self, batch, ds):
         tc = self.cfg.training
@@ -324,9 +305,40 @@ class MolDiffusionModule(L.LightningModule):
                 'lr_scheduler': {'scheduler': sch, 'interval': 'epoch'}}
 
 
+class RingCondDiffusionModule(MolDiffusionModule):
+    """
+    Ring-count-conditioned EGNN denoiser with classifier-free guidance.
+
+    Extends the unconditional module by injecting a ring count embedding into
+    the EGNN feature track. During training, cfg_dropout% of molecules have
+    their ring condition zeroed (null token), teaching the model to also work
+    unconditionally — enabling CFG guidance at inference.
+
+    Ring count buckets:  0=null(CFG), 1=0rings, 2=1ring, 3=2rings, 4=3+rings
+    Saves full module state to ring_cond_model.pt (includes ring_emb weights).
+    """
+
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        self.ring_emb = torch.nn.Embedding(5, cfg.model.hidden_dim)
+        print(f"  (+ring_emb: {sum(p.numel() for p in self.ring_emb.parameters())} params)")
+
+    def _cond_emb(self, batch):
+        buckets = batch.ring_count_bucket  # (B,)
+        if self.training and self.cfg.training.cfg_dropout > 0:
+            drop = torch.bernoulli(
+                torch.full((buckets.shape[0],), self.cfg.training.cfg_dropout,
+                           device=buckets.device)
+            ).bool()
+            buckets = buckets.masked_fill(drop, 0)
+        return self.ring_emb(buckets)[batch.batch]  # (N, hidden_dim)
+
+
+# ── Callbacks ─────────────────────────────────────────────────────────────────
+
 class WeightCheckpoint(L.Callback):
-    """Saves model weights as a plain .pt file whenever val_loss improves.
-    Keeps sample.py and the existing resume workflow working unchanged.
+    """Saves weights on val improvement. Saves full module state for conditional
+    models (includes ring_emb etc.) and model-only state for unconditional.
     """
     def __init__(self, path: str):
         self.path     = path
@@ -338,17 +350,28 @@ class WeightCheckpoint(L.Callback):
             val = val.item()
         if val < self.best_val:
             self.best_val = val
-            torch.save(pl_module.model.state_dict(), self.path)
+            if isinstance(pl_module, RingCondDiffusionModule):
+                # Full module state: includes ring_emb, needed for conditional inference
+                torch.save(pl_module.state_dict(), self.path)
+            else:
+                # GNNDenoiser weights only: backward compat with sample.py
+                torch.save(pl_module.model.state_dict(), self.path)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+_MODULE_CLASSES = {
+    'unconditional': MolDiffusionModule,
+    'ring_cond':     RingCondDiffusionModule,
+}
+
 @hydra.main(config_path="config", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
-    tc = cfg.training
+    tc  = cfg.training
+    cls = _MODULE_CLASSES[cfg.model.get('module', 'unconditional')]
 
     dm     = MolDataModule(cfg)
-    module = MolDiffusionModule(cfg)
+    module = cls(cfg)
 
     accel = 'mps' if torch.backends.mps.is_available() else 'auto'
 
@@ -365,8 +388,7 @@ def main(cfg: DictConfig) -> None:
         enable_model_summary=False,
     )
 
-    ckpt_path = tc.get('ckpt_path', None)
-    trainer.fit(module, datamodule=dm, ckpt_path=ckpt_path)
+    trainer.fit(module, datamodule=dm, ckpt_path=tc.get('ckpt_path', None))
 
     print(f"\nBest val loss: {weight_cb.best_val:.4f}")
     print(f"Weights saved to {tc.checkpoint}")

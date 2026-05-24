@@ -1,0 +1,22 @@
+# @package _global_
+# Quick sanity check for the ring-conditioned model.
+# 2 epochs, tiny model, 50 built-in molecules. ~10 seconds.
+#
+# Usage: python train.py experiment=sanity_ring_cond
+
+dataset:
+  source: builtin
+
+model:
+  hidden_dim: 32
+  n_layers: 2
+  t_dim: 16
+  module: ring_cond
+
+training:
+  epochs: 2
+  batch_size: 8
+  T: 50
+  lr_epochs: 10
+  cfg_dropout: 0.1
+  checkpoint: sanity_ring_cond_model.pt
