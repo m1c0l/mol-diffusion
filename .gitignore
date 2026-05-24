@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.png
 chembl_mols.json
+sanity_model.pt
+best_model_pre_egnn.pt
+.hydra/
+*.log

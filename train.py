@@ -16,13 +16,14 @@ Cartesian diffusion with no explicit constraint signal.
 
 import json
 import random
-import argparse
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data, Batch
+import hydra
+from omegaconf import DictConfig
 
 
 class MolData(Data):
@@ -198,17 +199,24 @@ def internal_corrupt(internals_list, clean_coords_list, t_vals, alpha_bar_np):
 
 # ── Training ─────────────────────────────────────────────────────────────────
 
-def train(args):
+def train(cfg: DictConfig):
+    t  = cfg.training
+    m  = cfg.model
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Device: {device}")
-    print(f"Internal coord diffusion: {args.use_internal}")
-    print(f"Constraint loss weight:   {args.lambda_constraint}")
+    print(f"Internal coord diffusion: {t.use_internal}")
+    print(f"Constraint loss weight:   {t.lambda_constraint}")
 
     print("Loading dataset...")
-    mols = build_dataset(source='chembl')
-    with open('chembl_mols.json') as f:
-        entries = json.load(f)
-    smiles_list = [e['smiles'] for e in entries[:len(mols)]]
+    source = cfg.dataset.source
+    mols = build_dataset(source=source)
+    if source == 'chembl':
+        with open('chembl_mols.json') as f:
+            entries = json.load(f)
+        smiles_list = [e['smiles'] for e in entries[:len(mols)]]
+    else:
+        from molecules import SMILES_LIST
+        smiles_list = [s for _, s in SMILES_LIST[:len(mols)]]
 
     random.seed(42)
     indices = list(range(len(mols)))
@@ -219,86 +227,84 @@ def train(args):
     train_ds = MolDataset([mols[i] for i in train_idx], [smiles_list[i] for i in train_idx])
     val_ds   = MolDataset([mols[i] for i in val_idx],   [smiles_list[i] for i in val_idx])
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+    train_loader = DataLoader(train_ds, batch_size=t.batch_size,
                               shuffle=True,  collate_fn=Batch.from_data_list)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+    val_loader   = DataLoader(val_ds,   batch_size=t.batch_size,
                               shuffle=False, collate_fn=Batch.from_data_list)
 
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    schedule     = cosine_schedule(args.T)
+    schedule     = cosine_schedule(t.T)
     schedule_dev = {k: v.to(device) for k, v in schedule.items()}
     alpha_bar_np = schedule['alpha_bar'].numpy()  # CPU numpy for internal_q_sample
 
-    model = GNNDenoiser(hidden_dim=args.hidden_dim, n_layers=args.n_layers).to(device)
+    model = GNNDenoiser(hidden_dim=m.hidden_dim, n_layers=m.n_layers, t_dim=m.t_dim).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    if args.resume:
-        model.load_state_dict(torch.load(args.resume, map_location=device))
-        print(f"Resumed from {args.resume}")
+    if t.resume:
+        model.load_state_dict(torch.load(t.resume, map_location=device))
+        print(f"Resumed from {t.resume}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=t.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.lr_epochs, eta_min=args.lr * 0.05
+        optimizer, T_max=t.lr_epochs, eta_min=t.lr * 0.05
     )
 
     train_losses, val_losses = [], []
     best_val = float('inf')
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, t.epochs + 1):
         model.train()
         epoch_loss = 0.0
 
         for batch in train_loader:
             B = batch.num_graphs
-            t = torch.randint(1, args.T + 1, (B,))  # keep on CPU for indexing
+            t_step = torch.randint(1, t.T + 1, (B,))  # keep on CPU for indexing
 
-            if args.use_internal:
+            if t.use_internal:
                 # Use stamped dataset_idx to look up pre-cached internals —
                 # avoids to_data_list() overhead and per-molecule geometry recomputation.
                 idx_list   = batch.dataset_idx.tolist()
                 internals  = [train_ds.internals[i] for i in idx_list]
                 coords_l   = [train_ds.coords[i]    for i in idx_list]
-                noisy_list, clean_list = internal_corrupt(internals, coords_l, t.tolist(), alpha_bar_np)
-                noisy_pos  = torch.from_numpy(np.concatenate(noisy_list, 0)).to(device)
-                x0_target  = torch.from_numpy(np.concatenate(clean_list,  0)).to(device)
+                noisy_list, clean_list = internal_corrupt(internals, coords_l, t_step.tolist(), alpha_bar_np)
+                noisy_pos  = torch.from_numpy(np.concatenate(noisy_list, 0).astype(np.float32)).to(device)
+                x0_target  = torch.from_numpy(np.concatenate(clean_list,  0).astype(np.float32)).to(device)
                 batch      = batch.to(device)
-                t          = t.to(device)
+                t_dev      = t_step.to(device)
 
                 x0_pred = model(noisy_pos, batch.atom_types,
                                 batch.edge_index, batch.edge_attr,
-                                t, batch=batch.batch)
+                                t_dev, batch=batch.batch)
                 loss = F.mse_loss(x0_pred, x0_target)
 
-                if args.lambda_constraint > 0:
+                if t.lambda_constraint > 0:
                     c_loss = bond_length_loss(x0_pred, batch.edge_index)
                     if batch.angle_triples.shape[0] > 0:
-                        # Normalize angle loss to ~[0,1] (divide by max squared degree error)
                         c_loss = c_loss + angle_constraint_loss(x0_pred, batch.angle_triples) / (180.0 ** 2)
-                    loss = loss + args.lambda_constraint * c_loss
+                    loss = loss + t.lambda_constraint * c_loss
             else:
                 batch      = batch.to(device)
-                t_per_atom = t.to(device)[batch.batch]
+                t_per_atom = t_step.to(device)[batch.batch]
                 noise      = torch.randn_like(batch.pos)
                 abar       = schedule_dev['alpha_bar'][t_per_atom].unsqueeze(-1)
                 noisy_pos  = batch.pos * abar.sqrt() + noise * (1 - abar).sqrt()
-                t          = t.to(device)
+                t_dev      = t_step.to(device)
 
                 pred_noise = model(noisy_pos, batch.atom_types,
                                    batch.edge_index, batch.edge_attr,
-                                   t, batch=batch.batch)
+                                   t_dev, batch=batch.batch)
                 loss = F.mse_loss(pred_noise, noise)
 
-                if args.lambda_constraint > 0:
-                    t_per_atom  = t[batch.batch]
+                if t.lambda_constraint > 0:
+                    t_per_atom  = t_dev[batch.batch]
                     abar        = schedule_dev['alpha_bar'][t_per_atom].unsqueeze(-1)
                     x0_hat      = (noisy_pos - pred_noise * (1 - abar).sqrt()) / (abar.sqrt() + 1e-8)
-                    x0_hat      = x0_hat.clamp(-10, 10)  # guard against t≈T explosion
-                    # Weight by mean ᾱ: constraint signal is only meaningful at low noise
-                    abar_weight = schedule_dev['alpha_bar'][t].mean()
+                    x0_hat      = x0_hat.clamp(-10, 10)
+                    abar_weight = schedule_dev['alpha_bar'][t_dev].mean()
                     c_loss      = bond_length_loss(x0_hat, batch.edge_index)
                     if batch.angle_triples.shape[0] > 0:
                         c_loss = c_loss + angle_constraint_loss(x0_hat, batch.angle_triples) / (180.0 ** 2)
-                    loss = loss + args.lambda_constraint * abar_weight * c_loss
+                    loss = loss + t.lambda_constraint * abar_weight * c_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -315,31 +321,31 @@ def train(args):
         with torch.no_grad():
             for batch in val_loader:
                 B = batch.num_graphs
-                t = torch.randint(1, args.T + 1, (B,))
+                t_step = torch.randint(1, t.T + 1, (B,))
 
-                if args.use_internal:
+                if t.use_internal:
                     idx_list   = batch.dataset_idx.tolist()
                     internals  = [val_ds.internals[i] for i in idx_list]
                     coords_l   = [val_ds.coords[i]    for i in idx_list]
-                    noisy_list, clean_list = internal_corrupt(internals, coords_l, t.tolist(), alpha_bar_np)
+                    noisy_list, clean_list = internal_corrupt(internals, coords_l, t_step.tolist(), alpha_bar_np)
                     noisy_pos  = torch.from_numpy(np.concatenate(noisy_list, 0)).to(device)
                     x0_target  = torch.from_numpy(np.concatenate(clean_list,  0)).to(device)
                     batch      = batch.to(device)
-                    t          = t.to(device)
+                    t_dev      = t_step.to(device)
                     x0_pred    = model(noisy_pos, batch.atom_types,
                                        batch.edge_index, batch.edge_attr,
-                                       t, batch=batch.batch)
+                                       t_dev, batch=batch.batch)
                     val_loss  += F.mse_loss(x0_pred, x0_target).item() * B
                 else:
                     batch      = batch.to(device)
-                    t_per_atom = t.to(device)[batch.batch]
+                    t_per_atom = t_step.to(device)[batch.batch]
                     noise      = torch.randn_like(batch.pos)
                     abar       = schedule_dev['alpha_bar'][t_per_atom].unsqueeze(-1)
                     noisy_pos  = batch.pos * abar.sqrt() + noise * (1 - abar).sqrt()
-                    t          = t.to(device)
+                    t_dev      = t_step.to(device)
                     pred_noise = model(noisy_pos, batch.atom_types,
                                        batch.edge_index, batch.edge_attr,
-                                       t, batch=batch.batch)
+                                       t_dev, batch=batch.batch)
                     val_loss  += F.mse_loss(pred_noise, noise).item() * B
 
         val_loss /= len(val_ds)
@@ -348,10 +354,10 @@ def train(args):
 
         if val_loss < best_val:
             best_val = val_loss
-            torch.save(model.state_dict(), 'best_model.pt')
+            torch.save(model.state_dict(), t.checkpoint)
 
-        if epoch % max(1, args.epochs // 10) == 0 or epoch == 1:
-            print(f"Epoch {epoch:4d}/{args.epochs}  "
+        if epoch % max(1, t.epochs // 10) == 0 or epoch == 1:
+            print(f"Epoch {epoch:4d}/{t.epochs}  "
                   f"train={epoch_loss:.4f}  val={val_loss:.4f}  "
                   f"lr={scheduler.get_last_lr()[0]:.2e}")
 
@@ -359,30 +365,19 @@ def train(args):
     ax.plot(train_losses, label='train')
     ax.plot(val_losses,   label='val')
     ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
-    ax.set_title(f'Denoising loss  (internal={args.use_internal}, λ={args.lambda_constraint})')
+    ax.set_title(f'Denoising loss  (internal={t.use_internal}, λ={t.lambda_constraint})')
     ax.legend()
     plt.tight_layout()
     plt.savefig('loss_curve.png', dpi=150)
     plt.close()
     print(f"\nBest val loss: {best_val:.4f}")
-    print("Saved best_model.pt and loss_curve.png")
+    print(f"Saved {t.checkpoint} and loss_curve.png")
+
+
+@hydra.main(config_path="config", config_name="config", version_base=None)
+def main(cfg: DictConfig) -> None:
+    train(cfg)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs',            type=int,   default=150)
-    parser.add_argument('--batch_size',        type=int,   default=32)
-    parser.add_argument('--hidden_dim',        type=int,   default=128)
-    parser.add_argument('--n_layers',          type=int,   default=4)
-    parser.add_argument('--lr',                type=float, default=3e-4)
-    parser.add_argument('--T',                 type=int,   default=200)
-    parser.add_argument('--use_internal',      action='store_true',
-                        help='Diffuse in internal coordinate space')
-    parser.add_argument('--lambda_constraint', type=float, default=0.0,
-                        help='Weight for bond length + angle constraint loss')
-    parser.add_argument('--resume',            type=str,   default=None,
-                        help='Path to checkpoint to resume from (e.g. best_model.pt)')
-    parser.add_argument('--lr_epochs',         type=int,   default=200,
-                        help='T_max for cosine LR schedule (independent of --epochs)')
-    args = parser.parse_args()
-    train(args)
+    main()
