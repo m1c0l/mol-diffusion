@@ -13,12 +13,12 @@ from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
 
-def fetch(min_atoms=4, max_atoms=50, target=3000):
-    print("Querying ChEMBL for approved small molecule drugs...")
+def fetch(min_atoms=4, max_atoms=50, target=15000, min_phase=1):
+    print(f"Querying ChEMBL for small molecules with max_phase >= {min_phase}...")
     molecule = new_client.molecule
     results = molecule.filter(
         molecule_type='Small molecule',
-        max_phase=4
+        max_phase__gte=min_phase,
     ).only(['molecule_chembl_id', 'molecule_structures'])
 
     print(f"Total returned: {len(results)}")
