@@ -69,12 +69,16 @@ class EGNNLayer(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
         )
-        # Scalar weight for equivariant coord update
+        # Scalar weight for equivariant coord update.
+        # Last layer zero-init: coord updates start at 0 and grow during training,
+        # preventing cascade amplification through deep stacks of EGNN layers.
         self.coord_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        nn.init.zeros_(self.coord_mlp[-1].weight)
+        nn.init.zeros_(self.coord_mlp[-1].bias)
         # Node feature update
         self.node_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -87,6 +91,8 @@ class EGNNLayer(nn.Module):
         src, dst = edge_index
         N = h.shape[0]
 
+        # Clamp coords before computing dist² to prevent float32 overflow in deep stacks
+        x     = x.clamp(-20, 20)
         rel   = x[src] - x[dst]                              # (E, 2) equivariant
         dist2 = (rel ** 2).sum(-1, keepdim=True)             # (E, 1) invariant
 

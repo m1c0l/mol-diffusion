@@ -286,6 +286,8 @@ class MolDiffusionModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self._forward(batch, self.train_ds)
+        if not torch.isfinite(loss):
+            return None  # skip batch; Lightning ignores None and doesn't update weights
         self.log('train_loss', loss, on_step=False, on_epoch=True,
                  prog_bar=True, batch_size=batch.num_graphs)
         return loss
@@ -386,6 +388,7 @@ def main(cfg: DictConfig) -> None:
         callbacks=[ckpt_cb, weight_cb],
         log_every_n_steps=1,
         enable_model_summary=False,
+        gradient_clip_val=1.0,
     )
 
     trainer.fit(module, datamodule=dm, ckpt_path=tc.get('ckpt_path', None))
