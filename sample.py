@@ -25,7 +25,7 @@ from model import GNNDenoiser
 from noise import cosine_schedule, p_sample_step_x0
 
 
-def load_model(path: str, device, hidden_dim=128, n_layers=4):
+def load_model(path: str, device, hidden_dim=128, n_layers=4, t_dim=64):
     """Load weights. Auto-detects conditional checkpoint by presence of ring_emb keys."""
     state = torch.load(path, map_location=device)
     ring_emb = None
@@ -39,7 +39,7 @@ def load_model(path: str, device, hidden_dim=128, n_layers=4):
     else:
         model_state = state
 
-    model = GNNDenoiser(hidden_dim=hidden_dim, n_layers=n_layers).to(device)
+    model = GNNDenoiser(hidden_dim=hidden_dim, n_layers=n_layers, t_dim=t_dim).to(device)
     model.load_state_dict(model_state)
     model.eval()
     return model, ring_emb
@@ -141,7 +141,8 @@ def evaluate(args):
 
     schedule = {k: v.to(device) for k, v in cosine_schedule(args.T).items()}
     model, ring_emb = load_model(args.checkpoint, device,
-                                 hidden_dim=args.hidden_dim, n_layers=args.n_layers)
+                                 hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+                                 t_dim=args.t_dim)
 
     if ring_emb is not None:
         cond_str = f"ring_cond  rings={args.rings}  guidance={args.guidance}"
@@ -244,9 +245,10 @@ def evaluate(args):
     plt.suptitle(f"Complexity ladder [{cond_label}]  |  Blue=RDKit  /  Coral=Generated",
                  fontsize=10)
     plt.tight_layout()
-    plt.savefig('generated_molecules.png', dpi=150)
+    out_mols = f'{args.prefix}_molecules.png' if args.prefix else 'generated_molecules.png'
+    plt.savefig(out_mols, dpi=150)
     plt.close()
-    print("Saved generated_molecules.png")
+    print(f"Saved {out_mols}")
 
     # ── Constraint distribution comparison ────────────────────────────────────
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
@@ -277,9 +279,10 @@ def evaluate(args):
 
     plt.suptitle('Generated vs Ground Truth Constraint Distributions', fontsize=11)
     plt.tight_layout()
-    plt.savefig('constraint_comparison.png', dpi=150)
+    out_cmp = f'{args.prefix}_constraints.png' if args.prefix else 'constraint_comparison.png'
+    plt.savefig(out_cmp, dpi=150)
     plt.close()
-    print("Saved constraint_comparison.png")
+    print(f"Saved {out_cmp}")
 
     print(f"\n{'':30s}  {'Ground truth':>15}  {'Generated':>12}")
     print(f"  {'Bond length mean':30s}  {np.mean(gt_bl):15.3f}  {np.mean(gen_bl):12.3f}")
@@ -295,6 +298,7 @@ if __name__ == '__main__':
     parser.add_argument('--T',          type=int,   default=200)
     parser.add_argument('--hidden_dim', type=int,   default=128)
     parser.add_argument('--n_layers',   type=int,   default=4)
+    parser.add_argument('--t_dim',      type=int,   default=64)
     # Ring conditioning (only used when checkpoint contains ring_emb weights)
     parser.add_argument('--rings',    type=int,   default=-1,
                         help='Target ring count: 0=acyclic, 1=one ring, 2=two, 3=three+. '
@@ -302,5 +306,8 @@ if __name__ == '__main__':
     parser.add_argument('--guidance', type=float, default=1.0,
                         help='CFG guidance scale. 1.0 = conditioned only. '
                              '>1.0 amplifies the conditioning signal.')
+    parser.add_argument('--prefix', default='',
+                        help='Output filename prefix. E.g. "large_ep30" → '
+                             'large_ep30_molecules.png, large_ep30_constraints.png')
     args = parser.parse_args()
     evaluate(args)
