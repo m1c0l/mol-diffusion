@@ -1,0 +1,17 @@
+# @package _global_
+# Scaled-up ring-conditioned model: 2x width, 1.5x depth.
+# hidden_dim 128→256, n_layers 4→6, t_dim 64→128.
+# Roughly 4-5x parameter count due to quadratic MLP scaling.
+#
+# Usage: python train.py experiment=ring_cond_large
+
+model:
+  hidden_dim: 256
+  n_layers: 6
+  t_dim: 128
+  module: ring_cond
+
+training:
+  cfg_dropout: 0.1
+  checkpoint: ring_cond_large_model.pt
+  lr: 1e-4  # lower LR for larger model — 3e-4 causes NaN divergence

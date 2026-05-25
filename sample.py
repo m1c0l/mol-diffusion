@@ -74,11 +74,16 @@ def sample_molecule(pyg_data, model, schedule, T: int, device,
 
     for t in range(T, 0, -1):
         t_tensor = torch.tensor([t], device=device)
-        x0_pred = model(coords, data.atom_types, data.edge_index, data.edge_attr,
-                        t_tensor, batch=batch, cond_emb=cond_emb)
+        coords = coords.clamp(-20, 20)
+        x0_pred = torch.nan_to_num(
+            model(coords, data.atom_types, data.edge_index, data.edge_attr,
+                  t_tensor, batch=batch, cond_emb=cond_emb),
+            nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20, 20)
         if null_emb is not None:
-            x0_null = model(coords, data.atom_types, data.edge_index, data.edge_attr,
-                            t_tensor, batch=batch, cond_emb=null_emb)
+            x0_null = torch.nan_to_num(
+                model(coords, data.atom_types, data.edge_index, data.edge_attr,
+                      t_tensor, batch=batch, cond_emb=null_emb),
+                nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20, 20)
             x0_pred = x0_null + guidance * (x0_pred - x0_null)
         coords = p_sample_step_x0(coords, x0_pred, t, schedule)
 
@@ -180,7 +185,7 @@ def evaluate(args):
         pyg    = mol_to_pyg_with_bond_types(mol, smiles)
         gen    = _sample(pyg)
         bl     = compute_bond_lengths(gen, mol.bonds)
-        if len(bl) > 0:
+        if len(bl) > 0 and bl.mean() > 1e-6:
             gen /= bl.mean()
         plot_results[idx] = gen
 
@@ -195,7 +200,7 @@ def evaluate(args):
         else:
             gen_coords = _sample(pyg)
             bl_gen = compute_bond_lengths(gen_coords, mol.bonds)
-            if len(bl_gen) > 0:
+            if len(bl_gen) > 0 and bl_gen.mean() > 1e-6:
                 gen_coords /= bl_gen.mean()
 
         bl_gen = compute_bond_lengths(gen_coords, mol.bonds)
