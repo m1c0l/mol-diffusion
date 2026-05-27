@@ -100,17 +100,33 @@ The coordinate track starts at noisy_coords and is refined across layers. The fi
 
 ### Full Architecture
 
+Two model configs are defined in `config/experiment/`:
+
+| Config | hidden | layers | t_dim | Params | Notes |
+|---|---|---|---|---|---|
+| `ring_cond` (base) | 128 | 4 | 64 | ~478k | Fast iteration |
+| `ring_cond_large` | 256 | 6 | 128 | ~2.75M | Better geometry |
+
 ```
-h init:  atom_emb(32) + t_emb(128) → Linear → hidden(128)
+h init:  atom_emb(32) + t_emb(t_dim) → Linear → hidden
 x init:  noisy_coords (2,)
 
-4 × EGNNLayer(hidden=128, edge_dim=4)
+N × EGNNLayer(hidden, edge_dim=4)
   each layer updates h (invariant) and x (equivariant) jointly
 
 output:  final x → predicted x0 (N, 2)
 ```
 
-~478k parameters. Trains in under an hour per 30 epochs on M3 MPS.
+The large model reaches lower val loss in fewer epochs (val ~5.15 at 100 epochs vs ~8.5 for base), and produces visibly tighter ring geometry.
+
+### Training Stability
+
+Deeper EGNN stacks are prone to coordinate explosion: `dist²` at each layer feeds back into the next, and with 6 layers the cascade can overflow float32 in the first forward pass. Three fixes:
+
+1. **Coord clamp per layer** — each `EGNNLayer.forward` clamps `x` to `[-20, 20]` before computing `dist²`, breaking the cascade.
+2. **Zero-init `coord_mlp`** — the final linear layer of the coordinate update MLP is initialized to zero, so equivariant updates start at 0 and grow gradually during training. This is standard practice in EGNN papers.
+3. **Gradient clipping** — `gradient_clip_val=1.0` in the Lightning Trainer prevents large gradient steps from destabilizing Adam's momentum.
+4. **NaN batch skip** — `training_step` returns `None` on non-finite loss; Lightning skips the backward, leaving weights intact.
 
 ---
 
@@ -128,18 +144,32 @@ Both losses are weighted by ᾱ_t (the noise level) so they contribute only when
 
 ## Training
 
+Training is managed by **PyTorch Lightning** with **Hydra** configuration.
+
+```bash
+python train.py                          # full unconditional run
+python train.py experiment=ring_cond     # ring-conditioned model
+python train.py experiment=ring_cond_large  # larger model
+python train.py experiment=sanity        # 2-epoch smoke test, builtin mols
 ```
---use_internal       diffuse in internal coordinate space, predict x0
---lambda_constraint  weight for bond length + angle constraint losses (0.5 works well)
---lr_epochs          T_max for cosine LR schedule, independent of --epochs (default 200)
-                     prevents premature LR annealing during iterative resume training
---resume             load weights from checkpoint before training
+
+Key config knobs (all overridable via CLI):
+
+```
+training.use_internal       diffuse in internal coordinate space, predict x0
+training.lambda_constraint  weight for bond length + angle losses (0.5)
+training.lr_epochs          T_max for cosine LR schedule, independent of epochs (200)
+                            prevents premature LR annealing during iterative resumes
+training.ckpt_path          full Lightning .ckpt resume (restores optimizer + scheduler)
+training.resume             weight-only .pt load (backward compat)
 ```
 
 Training objective (internal mode):
 ```python
 loss = MSE(x0_pred, x0_target) + λ * ᾱ_mean * (bond_length_loss + angle_loss)
 ```
+
+Lightning `ModelCheckpoint` saves the best `.ckpt` (full optimizer state) and a separate `WeightCheckpoint` callback saves a plain `.pt` for backward compatibility with `sample.py`.
 
 ---
 
@@ -167,14 +197,39 @@ The core loop — corrupt with noise, train a network to predict clean structure
 
 ---
 
-## Conditioning (Planned Extensions)
+## Conditioning
 
-The unconditional model learns p(molecule). Conditioning extends this to p(molecule | constraint):
+### Ring Count (Implemented)
+
+The first conditional model conditions on ring count — a simple, discrete, chemically meaningful property that's easy to verify visually.
+
+**Buckets**: 0 = null/CFG token, 1 = 0 rings, 2 = 1 ring, 3 = 2 rings, 4 = 3+ rings.
+
+**Injection**: A learned embedding `ring_emb: Embedding(5, hidden_dim)` maps the bucket to a vector that is added to `h` after the initial projection, before any EGNN layers. This keeps the injection in the invariant feature track.
+
+**Classifier-free guidance (CFG)**: 10% of training samples have their ring condition replaced by the null token (bucket 0), teaching the model to also operate unconditionally. At inference, you can run the denoiser twice per step — once conditioned, once with the null token — and interpolate:
+
+```python
+x0_guided = x0_null + guidance_scale * (x0_cond - x0_null)
+```
+
+`guidance_scale=1.0` is conditioned-only; `>1.0` amplifies the conditioning signal.
+
+**Architecture**: `RingCondDiffusionModule(MolDiffusionModule)` overrides only `_cond_emb()`. All training logic, optimizer, and scheduler are inherited from the unconditional base.
+
+**Usage**:
+```bash
+python train.py experiment=ring_cond
+python sample.py --checkpoint ring_cond_model.pt --rings 1
+python sample.py --checkpoint ring_cond_large_model.pt \
+    --rings 1 --guidance 2.0 --hidden_dim 256 --n_layers 6 --t_dim 128
+python find_rings.py   # score and display best-generated hexagonal rings
+```
+
+### Planned Extensions
 
 **Fixed substructure (scaffold)**: Clamp a subgraph's atoms back to their target positions after every denoising step. Free atoms denoise around the scaffold via message passing.
 
-**Global molecular properties**: Encode MW, logP, ring count as a vector, inject as condition embedding at each layer.
+**Global molecular properties**: Encode MW, logP as a vector, inject as condition embedding at each layer.
 
 **Binding site geometry**: Represent pocket as a point cloud with chemical features. Cross-attention lets each molecule atom attend to nearby pocket points — the SBDD setup equivalent to DiffSBDD.
-
-**Classifier-free guidance**: Drop condition with ~20% probability during training. At inference, extrapolate between conditional and unconditional predictions to control constraint adherence vs. diversity.
