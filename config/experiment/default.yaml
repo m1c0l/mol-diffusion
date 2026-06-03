@@ -1,0 +1,3 @@
+# @package _global_
+# Standard training run — override individual values on the CLI:
+#   python train.py training.epochs=50 training.resume=best_model.pt

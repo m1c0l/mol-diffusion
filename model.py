@@ -69,12 +69,16 @@ class EGNNLayer(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
         )
-        # Scalar weight for equivariant coord update
+        # Scalar weight for equivariant coord update.
+        # Last layer zero-init: coord updates start at 0 and grow during training,
+        # preventing cascade amplification through deep stacks of EGNN layers.
         self.coord_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+        nn.init.zeros_(self.coord_mlp[-1].weight)
+        nn.init.zeros_(self.coord_mlp[-1].bias)
         # Node feature update
         self.node_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -87,6 +91,8 @@ class EGNNLayer(nn.Module):
         src, dst = edge_index
         N = h.shape[0]
 
+        # Clamp coords before computing dist² to prevent float32 overflow in deep stacks
+        x     = x.clamp(-20, 20)
         rel   = x[src] - x[dst]                              # (E, 2) equivariant
         dist2 = (rel ** 2).sum(-1, keepdim=True)             # (E, 1) invariant
 
@@ -133,7 +139,8 @@ class GNNDenoiser(nn.Module):
 
         self.t_dim = t_dim
 
-    def forward(self, coords_noisy, atom_types, edge_index, edge_attr, t, batch=None):
+    def forward(self, coords_noisy, atom_types, edge_index, edge_attr, t,
+                batch=None, cond_emb=None):
         """
         coords_noisy: (N, 2)
         atom_types:   (N,)
@@ -141,6 +148,8 @@ class GNNDenoiser(nn.Module):
         edge_attr:    (E, n_bond_types)
         t:            (B,)
         batch:        (N,) or None
+        cond_emb:     (N, hidden_dim) or None — per-atom condition embedding
+                      (e.g. ring count, scaffold flags) added to h after input_proj
 
         Returns x0_pred: (N, 2) — predicted clean coordinates.
         """
@@ -156,6 +165,8 @@ class GNNDenoiser(nn.Module):
             t_emb_per_atom = t_emb[batch]
 
         h = self.input_proj(torch.cat([self.atom_emb(atom_types), t_emb_per_atom], dim=-1))
+        if cond_emb is not None:
+            h = h + cond_emb  # additive injection — same hidden_dim, preserves invariance
         x = coords_noisy
 
         for layer in self.layers:

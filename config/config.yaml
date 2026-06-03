@@ -1,0 +1,29 @@
+defaults:
+  - _self_
+  - experiment: default
+
+dataset:
+  source: chembl   # 'chembl' = full ~10k set | 'builtin' = 50 hardcoded molecules
+
+model:
+  hidden_dim: 128
+  n_layers: 4
+  t_dim: 64
+  module: unconditional  # 'unconditional' | 'ring_cond'
+
+training:
+  epochs: 150
+  batch_size: 32
+  lr: 3e-4
+  lr_epochs: 200
+  T: 200
+  use_internal: true
+  lambda_constraint: 0.5
+  resume: null       # weight-only .pt load (backward compat)
+  ckpt_path: null    # full Lightning .ckpt resume (restores optimizer + scheduler)
+  checkpoint: best_model.pt
+
+hydra:
+  run:
+    dir: .        # keep working directory as project root
+  output_subdir: .hydra

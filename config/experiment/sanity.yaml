@@ -1,0 +1,21 @@
+# @package _global_
+# Quick sanity check: 2 epochs, tiny model, 50 built-in molecules.
+# Completes in ~10 seconds. Verifies the training loop end-to-end.
+# Saves to sanity_model.pt so it never overwrites a real checkpoint.
+#
+# Usage: python train.py experiment=sanity
+
+dataset:
+  source: builtin
+
+model:
+  hidden_dim: 32
+  n_layers: 2
+  t_dim: 16
+
+training:
+  epochs: 2
+  batch_size: 8
+  T: 50
+  lr_epochs: 10
+  checkpoint: sanity_model.pt

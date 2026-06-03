@@ -1,0 +1,12 @@
+# @package _global_
+# Ring-count-conditioned model with classifier-free guidance (CFG).
+# Inherits all base settings; only overrides module-specific fields.
+#
+# Usage: python train.py experiment=ring_cond
+
+model:
+  module: ring_cond
+
+training:
+  cfg_dropout: 0.1
+  checkpoint: ring_cond_model.pt
