@@ -1,0 +1,22 @@
+# @package _global_
+# Extra-large ring-conditioned model: 1.5x width, 1.33x depth over `large`.
+# hidden_dim 256→384, n_layers 6→8, t_dim 128→192.
+# Roughly 3x the `large` parameter count (~8M) due to quadratic MLP scaling.
+#
+# Tests whether the epoch-29 val plateau of `large` (5.15) is a capacity
+# limit or a representation limit. Deeper stack raises NaN-cascade risk, so
+# the per-layer coord clamp + zero-init coord_mlp + grad clip must hold.
+#
+# Usage: python train.py experiment=ring_cond_xl
+
+model:
+  hidden_dim: 384
+  n_layers: 8
+  t_dim: 192
+  module: ring_cond
+
+training:
+  epochs: 100
+  cfg_dropout: 0.1
+  checkpoint: ring_cond_xl_model.pt
+  lr: 1e-4  # deeper than `large` — keep the conservative LR to avoid NaN divergence

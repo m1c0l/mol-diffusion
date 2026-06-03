@@ -1,0 +1,19 @@
+# @package _global_
+# Sanity check for the XL model: full architecture (384/8/192), real chembl
+# data, 2 epochs. Confirms the 8-layer stack builds, runs on MPS, and stays
+# finite (no dist² NaN cascade) before committing to a full 100-epoch run.
+# Saves to a separate file so it never clobbers ring_cond_xl_model.pt.
+#
+# Usage: python train.py experiment=sanity_ring_cond_xl
+
+model:
+  hidden_dim: 384
+  n_layers: 8
+  t_dim: 192
+  module: ring_cond
+
+training:
+  epochs: 2
+  cfg_dropout: 0.1
+  checkpoint: ring_cond_xl_sanity_model.pt
+  lr: 1e-4

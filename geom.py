@@ -191,6 +191,56 @@ def bond_length_loss(pred_coords: torch.Tensor, edge_index: torch.Tensor) -> tor
     return ((lengths - 1.0) ** 2).mean()
 
 
+def ring_closure_loss(pred_coords: torch.Tensor, edge_index: torch.Tensor,
+                      tree_src: torch.Tensor, tree_dst: torch.Tensor) -> torch.Tensor:
+    """
+    Extra length penalty on ring-closure bonds specifically.
+
+    Why this exists on top of bond_length_loss:
+      In internal-coordinate diffusion we only diffuse the spanning-tree edges.
+      A ring-closure bond (a real bond that is NOT in the spanning tree) has no
+      internal coordinate of its own — its two endpoints are placed independently
+      by walking the tree, so the bond's length is only *implied*. That is exactly
+      where rings fail: the two ends of the closure drift apart and the ring
+      doesn't close. bond_length_loss already includes these edges, but it averages
+      them in with all the (easier) tree edges. This term isolates the closure
+      bonds and lets us weight them separately, putting pressure right where the
+      geometry breaks.
+
+    Args:
+      pred_coords: (N, 2) predicted clean coordinates
+      edge_index:  (2, E) all directed molecular bonds (both directions)
+      tree_src/tree_dst: (E_tree,) spanning-tree edges, in the SAME global node
+                         index space as edge_index (PyG batching offsets both).
+
+    Returns scalar MSE of (closure bond length - 1.0), or 0 if there are none.
+    """
+    src, dst = edge_index
+    mask = src < dst  # one direction per undirected bond, so each bond counts once
+    src, dst = src[mask], dst[mask]
+    if src.shape[0] == 0:
+        return pred_coords.new_zeros(1).squeeze()
+
+    # Build the set of spanning-tree bonds as canonical (min, max) pairs so we can
+    # test membership regardless of stored direction. Encode each pair as a single
+    # integer key (a * N + b) to keep the membership test on tensors and cheap.
+    N = pred_coords.shape[0]
+    tlo = torch.minimum(tree_src, tree_dst)
+    thi = torch.maximum(tree_src, tree_dst)
+    tree_keys = tlo * N + thi                       # (E_tree,)
+
+    edge_keys = src * N + dst                        # src<dst already, so canonical
+
+    # A molecular bond is a ring closure iff it is NOT one of the spanning-tree bonds.
+    is_closure = ~torch.isin(edge_keys, tree_keys)   # (E_undirected,)
+    if is_closure.sum() == 0:
+        return pred_coords.new_zeros(1).squeeze()
+
+    c_src, c_dst = src[is_closure], dst[is_closure]
+    lengths = torch.norm(pred_coords[c_src] - pred_coords[c_dst], dim=-1)
+    return ((lengths - 1.0) ** 2).mean()
+
+
 def angle_constraint_loss(pred_coords: torch.Tensor,
                           angle_triples: torch.Tensor) -> torch.Tensor:
     """

@@ -21,12 +21,18 @@ from rdkit import Chem
 
 from dataset import build_dataset, compute_angle
 from train import MolDataset, mol_to_pyg_with_bond_types
-from model import GNNDenoiser
+from model import GNNDenoiser, BOND_VOCAB
 from noise import cosine_schedule, p_sample_step_x0
 
 
-def load_model(path: str, device, hidden_dim=128, n_layers=4, t_dim=64):
-    """Load weights. Auto-detects conditional checkpoint by presence of ring_emb keys."""
+def load_model(path: str, device, hidden_dim=128, n_layers=4, t_dim=64, self_cond=False):
+    """Load weights. Auto-detects conditional checkpoint by presence of ring_emb keys.
+
+    self_cond must match how the checkpoint was trained — it widens the first
+    EGNN layer's edge-feature input, so a mismatch fails to load. We accept it
+    explicitly (via CLI) but also auto-correct it from the weight shape below,
+    so old (non-self-cond) checkpoints keep loading without any flag.
+    """
     state = torch.load(path, map_location=device)
     ring_emb = None
     if any(k.startswith('ring_emb.') for k in state):
@@ -39,7 +45,18 @@ def load_model(path: str, device, hidden_dim=128, n_layers=4, t_dim=64):
     else:
         model_state = state
 
-    model = GNNDenoiser(hidden_dim=hidden_dim, n_layers=n_layers, t_dim=t_dim).to(device)
+    # Auto-detect self-conditioning from the first message MLP's input width.
+    # msg_mlp in_features = 2*hidden + 1 (dist²) + edge_dim, where edge_dim is
+    # len(BOND_VOCAB) normally, or len(BOND_VOCAB)+1 with self-conditioning.
+    w = model_state.get('layers.0.msg_mlp.0.weight')
+    if w is not None:
+        detected = (w.shape[1] - (2 * hidden_dim + 1)) > len(BOND_VOCAB)
+        if detected != self_cond:
+            print(f"  (auto-detected self_cond={detected} from checkpoint)")
+            self_cond = detected
+
+    model = GNNDenoiser(hidden_dim=hidden_dim, n_layers=n_layers, t_dim=t_dim,
+                        self_cond=self_cond).to(device)
     model.load_state_dict(model_state)
     model.eval()
     return model, ring_emb
@@ -72,19 +89,26 @@ def sample_molecule(pyg_data, model, schedule, T: int, device,
 
     coords = torch.randn(N, 2, device=device)
 
+    # Self-conditioning state: the model's previous-step x0 prediction, fed back
+    # in as a hint. Starts as None (cold start = zero hint) and is replaced each
+    # step by the guided prediction. Only consumed when the model has self_cond on.
+    x0_prev = None
+
     for t in range(T, 0, -1):
         t_tensor = torch.tensor([t], device=device)
         coords = coords.clamp(-20, 20)
         x0_pred = torch.nan_to_num(
             model(coords, data.atom_types, data.edge_index, data.edge_attr,
-                  t_tensor, batch=batch, cond_emb=cond_emb),
+                  t_tensor, batch=batch, cond_emb=cond_emb, x0_prev=x0_prev),
             nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20, 20)
         if null_emb is not None:
             x0_null = torch.nan_to_num(
                 model(coords, data.atom_types, data.edge_index, data.edge_attr,
-                      t_tensor, batch=batch, cond_emb=null_emb),
+                      t_tensor, batch=batch, cond_emb=null_emb, x0_prev=x0_prev),
                 nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20, 20)
             x0_pred = x0_null + guidance * (x0_pred - x0_null)
+        # Carry the (guided) prediction into the next step as the self-cond hint.
+        x0_prev = x0_pred
         coords = p_sample_step_x0(coords, x0_pred, t, schedule)
 
     return coords.cpu().numpy()
@@ -142,7 +166,7 @@ def evaluate(args):
     schedule = {k: v.to(device) for k, v in cosine_schedule(args.T).items()}
     model, ring_emb = load_model(args.checkpoint, device,
                                  hidden_dim=args.hidden_dim, n_layers=args.n_layers,
-                                 t_dim=args.t_dim)
+                                 t_dim=args.t_dim, self_cond=args.self_cond)
 
     if ring_emb is not None:
         cond_str = f"ring_cond  rings={args.rings}  guidance={args.guidance}"
@@ -299,6 +323,9 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', type=int,   default=128)
     parser.add_argument('--n_layers',   type=int,   default=4)
     parser.add_argument('--t_dim',      type=int,   default=64)
+    parser.add_argument('--self_cond',  action='store_true',
+                        help='Checkpoint was trained with self-conditioning. '
+                             'Auto-detected from weights if omitted.')
     # Ring conditioning (only used when checkpoint contains ring_emb weights)
     parser.add_argument('--rings',    type=int,   default=-1,
                         help='Target ring count: 0=acyclic, 1=one ring, 2=two, 3=three+. '

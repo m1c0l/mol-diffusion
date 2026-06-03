@@ -49,7 +49,7 @@ from model import GNNDenoiser, atom_idx, BOND_VOCAB
 from noise import cosine_schedule
 from geom import (
     build_spanning_tree, to_internal, from_internal,
-    bond_length_loss, angle_constraint_loss,
+    bond_length_loss, angle_constraint_loss, ring_closure_loss,
 )
 
 
@@ -208,7 +208,8 @@ class MolDiffusionModule(L.LightningModule):
         tc, mc = cfg.training, cfg.model
 
         self.model = GNNDenoiser(hidden_dim=mc.hidden_dim,
-                                 n_layers=mc.n_layers, t_dim=mc.t_dim)
+                                 n_layers=mc.n_layers, t_dim=mc.t_dim,
+                                 self_cond=mc.get('self_cond', False))
 
         schedule = cosine_schedule(tc.T)
         for k, v in schedule.items():
@@ -228,6 +229,44 @@ class MolDiffusionModule(L.LightningModule):
         """Returns per-atom condition embedding (N, hidden_dim) or None.
         Override in subclasses to add conditioning."""
         return None
+
+    def _run_denoiser(self, noisy_pos, batch, t_dev, cond):
+        """
+        Run the EGNN to predict clean coordinates x0.
+
+        With self-conditioning disabled this is a single plain forward pass.
+
+        With it enabled, we use the two-pass + stop-gradient scheme from
+        Chen et al. 2022 ("Analog Bits"). The model can optionally be told its
+        OWN previous x0 prediction; at inference the sampler naturally has last
+        step's prediction to feed in, but training jumps to a random noise level
+        so there is no previous step — we manufacture one:
+
+          - Flip one coin per training step. ~50% of the time leave x0_prev = 0,
+            which is exactly the cold-start the sampler hits on its first step, so
+            the model must still work with no hint.
+          - The other ~50%: do one extra forward under no_grad to get a realistic
+            previous prediction, DETACH it (stop-gradient), then forward again
+            conditioned on it. The loss is computed on this second pass only.
+
+        The detach is what keeps it cheap and well-posed: we train the model to
+        *use* a hint, not to backprop through the act of producing the hint, so
+        there is no second backward pass (~1.5x forward cost, 1x backward).
+        """
+        def fwd(x0_prev):
+            return self.model(noisy_pos, batch.atom_types, batch.edge_index,
+                              batch.edge_attr, t_dev, batch=batch.batch,
+                              cond_emb=cond, x0_prev=x0_prev)
+
+        if not self.cfg.model.get('self_cond', False):
+            return fwd(None)
+
+        x0_prev = torch.zeros_like(noisy_pos)  # cold-start hint
+        if torch.rand(()) < 0.5:
+            with torch.no_grad():
+                x0_prev = fwd(x0_prev)
+            x0_prev = x0_prev.detach()         # stop-gradient: hint is a fixed input
+        return fwd(x0_prev)
 
     def _forward(self, batch, ds):
         tc = self.cfg.training
@@ -249,9 +288,7 @@ class MolDiffusionModule(L.LightningModule):
             t_dev  = t_step.to(self.device)
             cond   = self._cond_emb(batch)
 
-            x0_pred = self.model(noisy_pos, batch.atom_types,
-                                 batch.edge_index, batch.edge_attr,
-                                 t_dev, batch=batch.batch, cond_emb=cond)
+            x0_pred = self._run_denoiser(noisy_pos, batch, t_dev, cond)
             loss = F.mse_loss(x0_pred, x0_target)
 
             if tc.lambda_constraint > 0:
@@ -259,6 +296,13 @@ class MolDiffusionModule(L.LightningModule):
                 if batch.angle_triples.shape[0] > 0:
                     c = c + angle_constraint_loss(x0_pred, batch.angle_triples) / (180.0 ** 2)
                 loss = loss + tc.lambda_constraint * c
+
+            # Extra, separately-weighted pressure on ring-closure bonds — the
+            # bonds the spanning tree only places implicitly, where rings fail.
+            if tc.get('lambda_ring_closure', 0.0) > 0:
+                rc = ring_closure_loss(x0_pred, batch.edge_index,
+                                       batch.tree_src, batch.tree_dst)
+                loss = loss + tc.lambda_ring_closure * rc
         else:
             batch      = batch.to(self.device)
             t_dev      = t_step.to(self.device)
@@ -338,6 +382,29 @@ class RingCondDiffusionModule(MolDiffusionModule):
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
 
+def _save_sampler_weights(pl_module, path, source_state=None):
+    """Write weights in the exact format sample.load_model expects.
+
+    Conditional models keep full module-style keys (model.* + ring_emb.*);
+    unconditional models save GNNDenoiser-only keys (the 'model.' prefix stripped).
+    `source_state` lets the EMA callback save its shadow weights instead of the
+    live ones; when None we read the module's current weights.
+    """
+    if isinstance(pl_module, RingCondDiffusionModule):
+        if source_state is None:
+            source_state = pl_module.state_dict()      # includes ring_emb + buffers
+        torch.save(dict(source_state), path)
+    else:
+        if source_state is None:
+            source_state = pl_module.model.state_dict()  # already 'model.'-free
+            torch.save(dict(source_state), path)
+        else:
+            # EMA shadow keys are module-style ('model.*'); strip to match GNNDenoiser.
+            stripped = {k[len('model.'):]: v for k, v in source_state.items()
+                        if k.startswith('model.')}
+            torch.save(stripped, path)
+
+
 class WeightCheckpoint(L.Callback):
     """Saves weights on val improvement. Saves full module state for conditional
     models (includes ring_emb etc.) and model-only state for unconditional.
@@ -352,12 +419,78 @@ class WeightCheckpoint(L.Callback):
             val = val.item()
         if val < self.best_val:
             self.best_val = val
-            if isinstance(pl_module, RingCondDiffusionModule):
-                # Full module state: includes ring_emb, needed for conditional inference
-                torch.save(pl_module.state_dict(), self.path)
-            else:
-                # GNNDenoiser weights only: backward compat with sample.py
-                torch.save(pl_module.model.state_dict(), self.path)
+            _save_sampler_weights(pl_module, self.path)
+
+
+class EMACallback(L.Callback):
+    """
+    Exponential moving average (EMA) of model weights — standard in diffusion
+    (DDPM, EDM). Keep a shadow copy of every trainable parameter, nudged toward
+    the live weights after each optimizer step:
+
+        shadow ← decay·shadow + (1 - decay)·weight
+
+    Late in training the optimizer doesn't sit at a point — the weights bounce
+    around inside the loss basin. The shadow averages over that trajectory and
+    lands nearer its center, which reliably gives lower-variance, usually-better
+    samples (and removes the "lucky epoch" noise we saw when picking checkpoints
+    by a wobbling val loss).
+
+    We swap the shadow weights in for validation (so val_loss reflects what we'll
+    actually sample from) and save the best shadow weights to `path`. The live
+    weights are restored afterwards so training continues normally; the separate
+    full-resume Lightning checkpoint still stores the live weights + optimizer.
+    """
+
+    def __init__(self, decay: float, path: str):
+        self.decay    = decay
+        self.path     = path
+        self.shadow   = {}              # param name -> averaged tensor
+        self.backup   = {}              # param name -> live tensor (during val swap)
+        self.best_val = float('inf')
+
+    def on_fit_start(self, trainer, pl_module):
+        # Seed the shadow from the current weights, before the pre-train sanity val.
+        self.shadow = {n: p.detach().clone()
+                       for n, p in pl_module.named_parameters() if p.requires_grad}
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
+        for n, p in pl_module.named_parameters():
+            if p.requires_grad:
+                self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
+
+    def _swap_in(self, pl_module):
+        """Stash live weights, load shadow weights into the module."""
+        self.backup = {}
+        for n, p in pl_module.named_parameters():
+            if n in self.shadow:
+                self.backup[n] = p.detach().clone()
+                p.data.copy_(self.shadow[n])
+
+    def _swap_out(self, pl_module):
+        """Restore the live weights stashed by _swap_in."""
+        for n, p in pl_module.named_parameters():
+            if n in self.backup:
+                p.data.copy_(self.backup[n])
+        self.backup = {}
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        if trainer.sanity_checking or not self.shadow:
+            return
+        self._swap_in(pl_module)        # validate on EMA weights
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking or not self.backup:
+            return
+        val = trainer.callback_metrics.get('val_loss', float('inf'))
+        if isinstance(val, torch.Tensor):
+            val = val.item()
+        if val < self.best_val:
+            self.best_val = val
+            # Save the shadow directly (independent of what's loaded in the module).
+            _save_sampler_weights(pl_module, self.path, source_state=self.shadow)
+        self._swap_out(pl_module)       # restore live weights for continued training
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -379,8 +512,13 @@ def main(cfg: DictConfig) -> None:
 
     ckpt_cb   = ModelCheckpoint(monitor='val_loss', mode='min',
                                 filename='lightning_best', dirpath='.',
-                                save_top_k=1, verbose=False)
-    weight_cb = WeightCheckpoint(tc.checkpoint)
+                                save_top_k=1, save_last=True, verbose=False)
+    # When EMA is enabled the sampler weights come from the EMA shadow (averaged
+    # over the training trajectory) instead of the raw live weights. EMACallback
+    # is a drop-in replacement for WeightCheckpoint: same .path / .best_val API,
+    # same "save best-by-val" behaviour, but it evaluates and saves the shadow.
+    weight_cb = (EMACallback(tc.get('ema_decay', 0.999), tc.checkpoint)
+                 if tc.get('ema', False) else WeightCheckpoint(tc.checkpoint))
 
     trainer = L.Trainer(
         max_epochs=tc.epochs,

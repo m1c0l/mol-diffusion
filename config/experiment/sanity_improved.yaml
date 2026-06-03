@@ -1,0 +1,32 @@
+# @package _global_
+# Combined sanity check for the three geometry improvements landed on the
+# `geometry-improvements` branch, all enabled at once:
+#   1. self_cond          — self-conditioning (extra invariant edge feature)
+#   2. lambda_ring_closure — extra penalty on ring-closure (non-tree) bonds
+#   3. ema                — EMA shadow weights drive the sampler checkpoint
+#
+# Deliberately tiny + fast: small model, builtin 50-molecule set, 2 epochs.
+# The goal is not quality but to exercise every new code path and confirm
+# nothing NaNs, the EMA shadow saves, and the self-cond inference path loads.
+# Saves to its own checkpoint so it never clobbers a real run.
+#
+# Usage: python train.py experiment=sanity_improved
+
+dataset:
+  source: builtin   # 50 hardcoded molecules — fast, no chembl load
+
+model:
+  hidden_dim: 64
+  n_layers: 3
+  t_dim: 32
+  module: ring_cond
+  self_cond: true
+
+training:
+  epochs: 2
+  cfg_dropout: 0.1
+  lambda_ring_closure: 0.5
+  ema: true
+  ema_decay: 0.99      # short run, so a faster-adapting decay than the 0.999 default
+  checkpoint: sanity_improved_model.pt
+  lr: 1e-4

@@ -10,6 +10,7 @@ model:
   n_layers: 4
   t_dim: 64
   module: unconditional  # 'unconditional' | 'ring_cond'
+  self_cond: false       # self-conditioning: feed prev x0 prediction as invariant edge feature
 
 training:
   epochs: 150
@@ -19,6 +20,9 @@ training:
   T: 200
   use_internal: true
   lambda_constraint: 0.5
+  lambda_ring_closure: 0.0  # extra penalty on ring-closure (non-tree) bond lengths; 0 = off
+  ema: false                # exponential moving average of weights for sampler checkpoint
+  ema_decay: 0.999          # EMA decay (only used when ema: true)
   resume: null       # weight-only .pt load (backward compat)
   ckpt_path: null    # full Lightning .ckpt resume (restores optimizer + scheduler)
   checkpoint: best_model.pt

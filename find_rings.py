@@ -66,7 +66,8 @@ def find_good_samples(args):
     model, ring_emb = load_model(args.checkpoint, device,
                                  hidden_dim=args.hidden_dim,
                                  n_layers=args.n_layers,
-                                 t_dim=args.t_dim)
+                                 t_dim=args.t_dim,
+                                 self_cond=args.self_cond)
 
     mols = build_dataset(source='chembl')
     with open('chembl_mols.json') as f:
@@ -183,6 +184,9 @@ if __name__ == '__main__':
     parser.add_argument('--rings',      type=int,   default=1,
                         help='Ring-count condition passed to model (-1=unconditional)')
     parser.add_argument('--guidance',   type=float, default=1.0)
+    parser.add_argument('--self_cond',  action='store_true',
+                        help='Checkpoint trained with self-conditioning '
+                             '(auto-detected from weights if omitted).')
     parser.add_argument('--prefix',     default='large_ep100')
     parser.add_argument('--seed',       type=int,   default=42)
     args = parser.parse_args()

@@ -118,11 +118,20 @@ class GNNDenoiser(nn.Module):
     pairwise distances) and guides the coordinate updates.
     """
 
-    def __init__(self, hidden_dim: int = 128, n_layers: int = 4, t_dim: int = 64):
+    def __init__(self, hidden_dim: int = 128, n_layers: int = 4, t_dim: int = 64,
+                 self_cond: bool = False):
         super().__init__()
         n_atom_types = len(ATOM_VOCAB)
         n_bond_types  = len(BOND_VOCAB)
-        edge_dim = n_bond_types
+
+        # Self-conditioning feeds the model its own previous x0 prediction. That
+        # prediction is a coordinate (equivariant) quantity, so it must NOT be
+        # concatenated into the invariant feature track h — that would break
+        # E(2)-equivariance. Instead we expose it as one extra INVARIANT edge
+        # feature: the pairwise distance of the previous prediction, which is
+        # rotation-invariant just like the dist² the EGNN already consumes.
+        self.self_cond = self_cond
+        edge_dim = n_bond_types + (1 if self_cond else 0)
 
         self.atom_emb = nn.Embedding(n_atom_types, 32)
         self.t_mlp = nn.Sequential(
@@ -140,7 +149,7 @@ class GNNDenoiser(nn.Module):
         self.t_dim = t_dim
 
     def forward(self, coords_noisy, atom_types, edge_index, edge_attr, t,
-                batch=None, cond_emb=None):
+                batch=None, cond_emb=None, x0_prev=None):
         """
         coords_noisy: (N, 2)
         atom_types:   (N,)
@@ -150,6 +159,9 @@ class GNNDenoiser(nn.Module):
         batch:        (N,) or None
         cond_emb:     (N, hidden_dim) or None — per-atom condition embedding
                       (e.g. ring count, scaffold flags) added to h after input_proj
+        x0_prev:      (N, 2) or None — previous x0 prediction for self-conditioning.
+                      Only used when the model was built with self_cond=True.
+                      None is treated as a zero hint (the sampler's cold start).
 
         Returns x0_pred: (N, 2) — predicted clean coordinates.
         """
@@ -168,6 +180,17 @@ class GNNDenoiser(nn.Module):
         if cond_emb is not None:
             h = h + cond_emb  # additive injection — same hidden_dim, preserves invariance
         x = coords_noisy
+
+        if self.self_cond:
+            # Turn the previous prediction into an invariant per-edge feature:
+            # the squared distance it placed between each bonded pair. A zero hint
+            # (None / cold start) yields a zero feature, so the model degrades
+            # gracefully to its no-self-conditioning behaviour.
+            if x0_prev is None:
+                x0_prev = torch.zeros_like(coords_noisy)
+            src, dst = edge_index
+            sc_dist2 = ((x0_prev[src] - x0_prev[dst]) ** 2).sum(-1, keepdim=True)  # (E, 1)
+            edge_attr = torch.cat([edge_attr, sc_dist2], dim=-1)                    # (E, edge_dim)
 
         for layer in self.layers:
             h, x = layer(h, x, edge_index, edge_attr)
