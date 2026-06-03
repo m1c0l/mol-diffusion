@@ -14,3 +14,5 @@ best_model_pre_egnn.pt
 lightning_best.ckpt
 lightning_best-v*.ckpt
 lightning_logs/
+*.pt
+*.ckpt
